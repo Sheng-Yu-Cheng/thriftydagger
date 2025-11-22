@@ -10,7 +10,7 @@ setup(
     py_modules=['thrifty'],
     version='0.0.1',
     install_requires=[
-        'mujoco-py',
+        'mujoco',
         'cloudpickle',
         'gymnasium',
         'joblib',
