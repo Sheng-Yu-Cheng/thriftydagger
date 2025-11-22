@@ -4,12 +4,11 @@ Code for the ThriftyDAgger algorithm. See the [website](https://sites.google.com
 
 ## Installation
 
-0. Start a Python virtual environment to self-contain all the code:
+1. create conda environment
+```sh
+conda create -n thrifty-dagger python=3.10
+conda activate thrifty-dagger
 ```
-virtualenv [name-of-env]
-source [name-of-env]/bin/activate
-```
-1. Install MuJoCo (see the https://github.com/openai/mujoco-py README). You will need an access key.
 2. Install this python package: 
 ```
 pip install -e .
