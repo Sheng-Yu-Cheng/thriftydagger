@@ -15,6 +15,8 @@ import numpy as np
 import sys
 import time
 
+from thrifty.robomimic_expert import RobomimicExpert
+expert_pol = RobomimicExpert("expert_model/model_epoch_200_low_dim_v15_success_0.1.pth", device="cuda" if torch.cuda.is_available() else "cpu")
 
 class CustomWrapper(gymnasium.Env):
 
@@ -134,19 +136,14 @@ if __name__ == "__main__":
 
     if args.environment == "NutAssembly":
         env = suite.make(
-            **config,
-            gripper_types="default",
-            has_renderer=render,
+            env_name="Square",
+            robots="Panda",              # 要跟 robomimic config 用的一樣
+            has_renderer=not args.no_render,
             has_offscreen_renderer=False,
-            render_camera="agentview",
-            single_object_mode=2,  # env has 1 nut instead of 2
-            nut_type="round",
-            ignore_done=True,
-            use_camera_obs=False,
-            reward_shaping=True,
+            use_object_obs=True,
+            use_camera_obs=False,        # 若你走 low_dim expert
             control_freq=20,
-            hard_reset=True,
-            use_object_obs=True
+            horizon=400,                 # 可依 Square 任務調
         )
     else:
         env = suite.make(
@@ -189,7 +186,7 @@ if __name__ == "__main__":
                 break
         return a[3] != 0
 
-    def expert_pol(o):
+    def human_expert_pol(o):
         a = np.zeros(7)
         if env.gripper_closed:
             a[-1] = 1.0
@@ -217,6 +214,8 @@ if __name__ == "__main__":
     robosuite_cfg = {"MAX_EP_LEN": 175, "INPUT_DEVICE": input_device}
     if args.algo_sup:
         expert_pol = HardcodedPolicy(env).act
+    elif args.hgdagger:
+        expert_pol = human_expert_pol
     if args.gen_data:
         NUM_BC_EPISODES = 30
         generate_offline_data(
