@@ -1,95 +1,153 @@
 import json
-
 import numpy as np
+import torch
+
 import robomimic.utils.obs_utils as ObsUtils
-from robomimic.config import config_factory
 import robomimic.utils.file_utils as FileUtils
+from robomimic.config import config_factory
 
 
 class RobomimicExpert:
     """
-    載入 robomimic checkpoint，提供一個 expert_policy(obs) 介面，
-    可以直接丟給 thriftydagger 使用。
+    Load a robomimic checkpoint and expose an expert_policy(obs) interface for ThriftyDAgger.
+    Expected obs dim: 23 = [ robot0_eef_pos(3), robot0_eef_quat(4), robot0_gripper_qpos(2), object(14) ]
     """
 
     def __init__(self, ckpt_path, device="cuda"):
-        # 從 checkpoint 載入 policy 和 config dict
+        self.device = device
+
+        # 1. Load policy + ckpt_dict
         self.policy, self.ckpt_dict = FileUtils.policy_from_checkpoint(
-            ckpt_path=ckpt_path, device=device, verbose=True
+            ckpt_path=ckpt_path,
+            device=device,
+            verbose=True,
         )
 
-        # ckpt_dict["config"] 在新版 robomimic 通常是一個 JSON 字串
+        # 2. Initialize robomimic obs utils from config
         raw_cfg = self.ckpt_dict["config"]
-        algo_name = self.ckpt_dict.get("algo_name", None)
-
         if isinstance(raw_cfg, str):
             cfg_dict = json.loads(raw_cfg)
         else:
-            # 可能已經是 dict
             cfg_dict = raw_cfg
 
-        if algo_name is None and isinstance(cfg_dict, dict):
-            algo_name = cfg_dict.get("algo_name", "bc")
-
-        # 建成 robomimic 的 Config 物件
+        algo_name = self.ckpt_dict.get("algo_name", "bc")
         config = config_factory(algo_name, dic=cfg_dict)
 
-        # 用這個 config 初始化 ObsUtils（告訴 robomimic 哪些 key 是 low_dim / rgb 等）
         ObsUtils.initialize_obs_utils_with_config(config)
+        self.env_wrapper = None
+
+    def set_env(self, env_wrapper):
+        """Bind environment wrapper so we can recover raw observations when needed."""
+        self.env_wrapper = env_wrapper
+
+    def _flatten_obs_dict(self, obs_dict):
+        """Build the expected 23-d observation vector from a raw robosuite obs dict."""
+
+        def pick(keys):
+            for k in keys:
+                if k in obs_dict:
+                    return obs_dict[k]
+            return None
+
+        eef_pos = pick(["robot0_eef_pos"])
+        eef_quat = pick(["robot0_eef_quat"])
+        gripper = pick(["robot0_gripper_qpos"])
+        obj = pick(["object", "object-state"])
+
+        missing = [
+            name
+            for name, val in [
+                ("robot0_eef_pos", eef_pos),
+                ("robot0_eef_quat", eef_quat),
+                ("robot0_gripper_qpos", gripper),
+                ("object", obj),
+            ]
+            if val is None
+        ]
+        if missing:
+            raise ValueError(
+                f"RobomimicExpert is missing required obs keys: {missing}; available keys: {list(obs_dict.keys())}"
+            )
+
+        def ensure_batch(x):
+            x = np.asarray(x, dtype=np.float32)
+            if x.ndim == 1:
+                x = x[None, :]
+            return x
+
+        eef_pos = ensure_batch(eef_pos)
+        eef_quat = ensure_batch(eef_quat)
+        gripper = ensure_batch(gripper)
+        obj = ensure_batch(obj)
+
+        # Some robosuite versions provide a longer object-state; truncate to the 14 dims used for training.
+        if obj.shape[-1] > 14:
+            obj = obj[..., :14]
+
+        if not (
+            eef_pos.shape[0]
+            == eef_quat.shape[0]
+            == gripper.shape[0]
+            == obj.shape[0]
+        ):
+            raise ValueError(
+                "RobomimicExpert could not align batch dims: "
+                f"eef_pos{eef_pos.shape}, eef_quat{eef_quat.shape}, gripper{gripper.shape}, obj{obj.shape}"
+            )
+
+        return np.concatenate([eef_pos, eef_quat, gripper, obj], axis=-1)
 
     def __call__(self, obs):
-        import torch
+        """
+        obs: observation from Thrifty (numpy array or (obs, info) tuple), shape (23,) or (1,23)
+        returns: action vector (7,) for env.step
+        """
 
-        # 如果 env 回傳的是 (obs, reward, done, info) 這種 tuple，就只拿 obs
+        # unwrap (obs, info) if needed
         if isinstance(obs, (tuple, list)):
             obs = obs[0]
 
-        # ---------- 情況一：obs 是 dict ----------
-        if isinstance(obs, dict):
-            # 只保留 policy 比較有可能真的用到、而且不會炸掉的 key
-            # 注意：刻意把 "object" 排除掉，避免 KeyError('object')
-            allowed_keys = {
-                "robot0_eef_pos",
-                "robot0_eef_quat",
-                "robot0_gripper_qpos",
-            }
+        obs = np.asarray(obs, dtype=np.float32)
 
-            filtered = {}
-            for k, v in obs.items():
-                if k not in allowed_keys:
-                    continue
-                arr = np.asarray(v)
-                if arr.ndim == 1:
-                    arr = arr[None, :]      # 加 batch 維度 -> (1, dim)
-                filtered[k] = arr
+        # ensure batch dimension
+        if obs.ndim == 1:
+            obs = obs[None, :]
 
-            # 萬一上面一句一個都沒抓到，就退而求其次：全部 flatten 成一個向量
-            if len(filtered) == 0:
-                flat = np.concatenate(
-                    [np.asarray(v).ravel() for v in obs.values()]
-                ).astype(np.float32)[None, :]   # (1, D)
-                filtered = {"obs": flat}
+        # Try to use the raw observation dictionary from the caching wrapper
+        # This is more reliable than trying to decompose the flattened observation
+        if obs.shape[-1] != 23:
+            if self.env_wrapper is not None and hasattr(self.env_wrapper, "latest_obs_dict"):
+                source_dict = self.env_wrapper.latest_obs_dict
+                obs = self._flatten_obs_dict(source_dict)
+            else:
+                raise ValueError(
+                    f"RobomimicExpert expected obs dim 23 but got {obs.shape}; "
+                    "could not retrieve raw observation dict from environment wrapper"
+                )
 
-            input_obs = filtered
+        eef_pos      = obs[0:3]     # (3,)
+        eef_quat     = obs[3:7]     # (4,)
+        gripper_qpos = obs[7:9]     # (2,)
+        obj          = obs[9:23]    # (14,)
 
-        # ---------- 情況二：obs 不是 dict（例如是一個純向量） ----------
-        else:
-            arr = np.asarray(obs)
-            if arr.ndim == 1:
-                arr = arr[None, :]   # (1, dim)
-            input_obs = {"obs": arr}
+        # robomimic expects this flat structure (not nested under "obs")
+        obs_dict = {
+            "robot0_eef_pos": eef_pos,
+            "robot0_eef_quat": eef_quat,
+            "robot0_gripper_qpos": gripper_qpos,
+            "object": obj,
+        }
 
-        # 丟進 robomimic policy
         with torch.no_grad():
-            act = self.policy(ob=input_obs)
+            act = self.policy(ob=obs_dict)
 
-        # 轉 numpy
+        # to numpy
         if isinstance(act, torch.Tensor):
             act = act.detach().cpu().numpy()
         else:
             act = np.asarray(act, dtype=np.float32)
 
-        # 如果是 (1, act_dim)，把 batch 維度去掉 -> (act_dim,)
+        # drop batch dim if present
         if act.ndim > 1 and act.shape[0] == 1:
             act = act[0]
 

@@ -24,6 +24,32 @@ expert_pol = RobomimicExpert(
     device="cuda" if torch.cuda.is_available() else "cpu",
 )
 
+class ObsCachingWrapper:
+    """
+    Lightweight wrapper that caches raw robosuite dict observations.
+    Not a Gymnasium wrapper because the base robosuite env is not a Gym Env.
+    """
+    def __init__(self, env):
+        self.env = env
+        self.latest_obs_dict = None
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        self.latest_obs_dict = obs
+        return obs
+
+    def step(self, action):
+        result = self.env.step(action)
+        if isinstance(result, tuple) and len(result) == 5:
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+        else:
+            obs, reward, done, info = result
+        self.latest_obs_dict = obs
+        return obs, reward, done, info
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
 
 class CustomWrapper(gymnasium.Env):
     def __init__(self, env, render):
@@ -35,17 +61,30 @@ class CustomWrapper(gymnasium.Env):
         self.robots = env.robots
         self._render = render
 
+    def _step(self, action):
+        """
+        Normalize step outputs to (obs, reward, done, info) even if the base env
+        follows the Gymnasium API and returns terminated/truncated separately.
+        """
+        result = self.env.step(action)
+        if isinstance(result, tuple) and len(result) == 5:
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+            return obs, reward, done, info
+        return result
+
     def reset(self):
-        r = self.env.reset()
+        res = self.env.reset()      # o ?O obs ?V?q (23,)
+        o = res[0] if isinstance(res, tuple) else res
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = -1
         for _ in range(10):
-            r = self.env.step(settle_action)
-            print(r)
+            o, r, d, info = self._step(settle_action)
+            # print(o, r, d, info)  # ?u???n debug ?A?L
             self.render()
         self.gripper_closed = False
-        return r
+        return o
 
     def step(self, action):
         # abstract 10 actions as 1 action
@@ -53,12 +92,12 @@ class CustomWrapper(gymnasium.Env):
         action_ = action.copy()
         action_[3] = 0.0
         action_[4] = 0.0
-        self.env.step(action_)
+        self._step(action_)
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = action[-1]
         for _ in range(10):
-            r1, r2, r3, r4 = self.env.step(settle_action)
+            r1, r2, r3, r4 = self._step(settle_action)
             self.render()
         if action[-1] > 0:
             self.gripper_closed = True
@@ -166,7 +205,19 @@ if __name__ == "__main__":
         use_object_obs=True,
     )
 
-    env = GymWrapper(env)
+    obs_cacher = ObsCachingWrapper(env)
+    if isinstance(expert_pol, RobomimicExpert):
+        print("Binding environment wrapper to RobomimicExpert...")
+        expert_pol.set_env(obs_cacher)
+    env = GymWrapper(
+        obs_cacher,     
+        keys=[
+            "robot0_eef_pos",
+            "robot0_eef_quat",
+            "robot0_gripper_qpos",
+            "object",
+        ],
+    )
     env = VisualizationWrapper(env, indicator_configs=None)
     env = CustomWrapper(env, render=render)
 
